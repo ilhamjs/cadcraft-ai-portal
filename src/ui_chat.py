@@ -30,6 +30,12 @@ from src.supabase_client import (
 )
 
 SUPPORTED_FILE_TYPES = ["dwg", "dxf", "jpg", "jpeg", "png", "pdf"]
+EXECUTION_MODES = ["fast_flash", "fast_optimized", "extra_time"]
+EXECUTION_MODE_LABELS = {
+    "fast_flash": "🚀 Fast-Flash",
+    "fast_optimized": "⚡ Fast-Optimized",
+    "extra_time": "🐢 Extra-Time",
+}
 
 
 def _sanitize_filename(name: str) -> str:
@@ -159,7 +165,7 @@ def render_sidebar_Sessions(db: CADPortalDatabase, worker_status: Dict[str, Any]
                     "failed": "❌",
                 }.get(status, "💬")
 
-                raw_prompt = (job_info.get("user_prompt") or "").strip()
+                raw_prompt = _strip_model_tag((job_info.get("user_prompt") or "").strip())
                 if "[INSTRUKSI USER]:" in raw_prompt:
                     raw_prompt = raw_prompt.split("[INSTRUKSI USER]:")[-1].strip()
                 first_line = raw_prompt.splitlines()[0] if raw_prompt else "Percakapan CAD"
@@ -250,9 +256,12 @@ def _build_combined_instruction(
     user_prompt: str,
     kop_block: str = "",
     model_name: str = "",
+    execution_mode: str = "extra_time",
 ) -> str:
-    """Combine per-job model tag, selected skill instructions, and optional Kop Drawing data."""
+    """Combine execution mode tag, per-job model tag, skill instructions, and Kop data."""
     parts: List[str] = []
+    if execution_mode.strip():
+        parts.append(f"[EXEC_MODE: {execution_mode.strip()}]")
     if model_name.strip():
         parts.append(f"[MODEL: {model_name.strip()}]")
     parts.extend(s.system_instruction for s in get_skills_by_ids(skill_ids) if s.system_instruction)
@@ -263,30 +272,48 @@ def _build_combined_instruction(
     return f"{header}\n\n[INSTRUKSI USER]:\n{clean_prompt}" if header else clean_prompt
 
 
+def _extract_header_tag(raw_prompt: str, prefix: str) -> Optional[str]:
+    for line in raw_prompt.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(prefix) and s.endswith("]"):
+            val = s[len(prefix):-1].strip()
+            return val or None
+        if not s.startswith("["):
+            break
+    return None
+
+
+def _extract_job_exec_mode(job: Dict[str, Any], fallback: str = "extra_time") -> str:
+    """Read `execution_mode` from job field or `[EXEC_MODE: ...]` header tag."""
+    direct = (job.get("execution_mode") or "").strip()
+    if direct in EXECUTION_MODES:
+        return direct
+    parsed = _extract_header_tag(job.get("user_prompt") or "", "[EXEC_MODE:")
+    return parsed if parsed in EXECUTION_MODES else fallback
+
+
 def _extract_job_model(job: Dict[str, Any], fallback: str) -> str:
     """Read the job-specific `[MODEL: ...]` tag so parallel tabs never overwrite each other."""
-    raw = (job.get("user_prompt") or "").lstrip()
-    if raw.startswith("[MODEL:"):
-        first_nl = raw.find("\n")
-        header_line = raw[:first_nl] if first_nl != -1 else raw
-        if header_line.endswith("]"):
-            parsed = header_line[len("[MODEL:"):-1].strip()
-            if parsed:
-                return parsed
-    return fallback
+    parsed = _extract_header_tag(job.get("user_prompt") or "", "[MODEL:")
+    return parsed or fallback
 
 
 def _strip_model_tag(text: str) -> str:
-    """Keep user chat bubbles clean by hiding internal [MODEL: ...] and [SKILL AKTIF: ...] headers."""
+    """Keep user chat bubbles clean by hiding internal `[EXEC_MODE: ...]`, `[MODEL: ...]`, and skill headers."""
     if "[INSTRUKSI USER]:" in text:
         return text.split("[INSTRUKSI USER]:", 1)[-1].strip()
-    stripped = text.lstrip()
-    if stripped.startswith("[MODEL:"):
-        first_nl = stripped.find("\n")
-        header_line = stripped[:first_nl] if first_nl != -1 else stripped
-        if header_line.endswith("]"):
-            return stripped[first_nl + 1:].lstrip() if first_nl != -1 else ""
-    return text
+    lines = text.lstrip().splitlines()
+    while lines:
+        first = lines[0].strip()
+        if (first.startswith("[EXEC_MODE:") or first.startswith("[MODEL:")) and first.endswith("]"):
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+        else:
+            break
+    return "\n".join(lines).strip() if lines else ""
 
 
 def _render_temporary_downloads(db: CADPortalDatabase, job: Dict[str, Any]) -> None:
@@ -403,8 +430,13 @@ def _render_pending_kop_prompt(db: CADPortalDatabase, requester_name: str) -> No
                         kop_block = "[KOP DRAWING]\nUser tidak membutuhkan Kop Drawing; langsung buat gambar kerja sesuai instruksi."
 
                     chosen_model = pending.get("model_name") or st.session_state.get("selected_model") or get_current_cli_model()
+                    exec_mode = pending.get("execution_mode", st.session_state.get("selected_exec_mode", "extra_time"))
                     full_instruction = _build_combined_instruction(
-                        skill_ids, user_prompt, kop_block=kop_block, model_name=chosen_model
+                        skill_ids,
+                        user_prompt,
+                        kop_block=kop_block,
+                        model_name=chosen_model,
+                        execution_mode=exec_mode,
                     )
                     created_job = db.create_cad_job(
                         requester_name=requester_name,
@@ -473,9 +505,17 @@ def render_chat_interface(db: CADPortalDatabase, worker_status: Dict[str, Any]) 
                         st.caption(f"📎 `{fname}`")
 
         status = job.get("status", "queued")
-        active_model_name = _extract_job_model(
-            job, st.session_state.get("selected_model") or get_current_cli_model()
+        job_exec_mode = _extract_job_exec_mode(
+            job, st.session_state.get("selected_exec_mode", "extra_time")
         )
+        if job_exec_mode == "fast_flash":
+            active_model_name = "Fast-Flash (Auto: Hydrogen Med → Low)"
+        elif job_exec_mode == "fast_optimized":
+            active_model_name = "Fast-Optimized (Auto: Argon/Hydrogen High → Low → Verify)"
+        else:
+            active_model_name = _extract_job_model(
+                job, st.session_state.get("selected_model") or get_current_cli_model()
+            )
 
         # Animated processing status while waiting/running
         if status in ("waiting_offline", "queued", "approved", "processing"):
@@ -562,25 +602,61 @@ def render_chat_interface(db: CADPortalDatabase, worker_status: Dict[str, Any]) 
         key="main_dropzone_uploader",
     )
 
-    # Model Selector integrated right above the prompt box (per-session, does not overwrite other tabs/users)
+    # Execution Mode + Model Selector row right below the upload box
     available_models = get_available_models()
     if "selected_model" not in st.session_state or st.session_state.selected_model not in available_models:
         st.session_state.selected_model = get_current_cli_model()
+    if "selected_exec_mode" not in st.session_state or st.session_state.selected_exec_mode not in EXECUTION_MODES:
+        st.session_state.selected_exec_mode = "extra_time"
+
     current_model = st.session_state.selected_model
     default_idx = available_models.index(current_model) if current_model in available_models else 0
+    current_exec_mode = st.session_state.selected_exec_mode
 
-    col_spacer, col_model = st.columns([2.2, 1.8])
-    with col_model:
-        chosen_model = st.selectbox(
-            "Model AI (Antigravity CLI)",
-            options=available_models,
-            index=default_idx,
-            format_func=get_model_display_label,
+    col_mode, col_model = st.columns([1.8, 2.2])
+    with col_mode:
+        chosen_exec_mode = st.selectbox(
+            "Execution Mode",
+            options=EXECUTION_MODES,
+            index=EXECUTION_MODES.index(current_exec_mode),
+            format_func=lambda m: EXECUTION_MODE_LABELS.get(m, m),
             label_visibility="collapsed",
-            key="chatbox_model_selector",
+            key="chatbox_exec_mode_selector",
         )
-        if chosen_model != current_model:
-            st.session_state.selected_model = chosen_model
+        if chosen_exec_mode != current_exec_mode:
+            st.session_state.selected_exec_mode = chosen_exec_mode
+            st.rerun()
+
+    with col_model:
+        if current_exec_mode == "fast_flash":
+            st.selectbox(
+                "Model AI",
+                options=["Auto: Hydrogen Med → Low"],
+                index=0,
+                disabled=True,
+                label_visibility="collapsed",
+                key="chatbox_model_locked_ff",
+            )
+        elif current_exec_mode == "fast_optimized":
+            st.selectbox(
+                "Model AI",
+                options=["Auto: Argon/Hydrogen High → Low → Verify"],
+                index=0,
+                disabled=True,
+                label_visibility="collapsed",
+                key="chatbox_model_locked_fo",
+            )
+        else:
+            chosen_model = st.selectbox(
+                "Model AI (Antigravity CLI)",
+                options=available_models,
+                index=default_idx,
+                format_func=get_model_display_label,
+                label_visibility="collapsed",
+                key="chatbox_model_selector",
+            )
+            if chosen_model != current_model:
+                st.session_state.selected_model = chosen_model
 
     prompt_text = st.chat_input(active_skills[0].placeholder)
 
@@ -591,6 +667,7 @@ def render_chat_interface(db: CADPortalDatabase, worker_status: Dict[str, Any]) 
                 "files": [(f.name, f.getvalue()) for f in (uploaded_files or [])],
                 "skill_ids": list(selected_skill_ids),
                 "model_name": st.session_state.selected_model,
+                "execution_mode": st.session_state.selected_exec_mode,
             }
             st.rerun()
 
@@ -600,6 +677,7 @@ def render_chat_interface(db: CADPortalDatabase, worker_status: Dict[str, Any]) 
                 selected_skill_ids,
                 prompt_text,
                 model_name=st.session_state.selected_model,
+                execution_mode=st.session_state.selected_exec_mode,
             )
 
             created_job = db.create_cad_job(
