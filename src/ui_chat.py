@@ -603,7 +603,7 @@ def render_chat_interface(db: CADPortalDatabase, worker_status: Dict[str, Any]) 
     )
 
     # Execution Mode + Model Selector row right below the upload box
-    available_models = get_available_models()
+    available_models = get_available_models(db)
     if "selected_model" not in st.session_state or st.session_state.selected_model not in available_models:
         st.session_state.selected_model = get_current_cli_model()
     if "selected_exec_mode" not in st.session_state or st.session_state.selected_exec_mode not in EXECUTION_MODES:
